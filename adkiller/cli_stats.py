@@ -22,6 +22,7 @@ TRIGGER_LABELS: dict[str, str] = {
     "malware_file": "木马安装包",
     "via_bot": "外联机器人卡片",
     "start_cmd": "群内 /start 刷屏",
+    "channel_review": "频道消息待复核",
     "external_channel": "外部频道马甲",
     "basic_rules": "本地关键词规则",
     "manual_sban": "管理员手动封禁",

@@ -905,9 +905,16 @@ run_cli_subcommand() {
         exit 1
       fi
       if ! verify_git_remote "$WORK_DIR"; then
-        printf '❌ 目录 %s 缺少有效的 Git 远端元数据（例如早期通过压缩包部署，或远端与官方仓库不匹配），无法执行 git pull。\n' "$WORK_DIR" >&2
+        printf '❌ 目录 %s 缺少有效的 Git 远端元数据（例如早期通过压缩包部署，或远端与本仓库不匹配），无法执行 git pull。\n' "$WORK_DIR" >&2
         printf '   💡 若为旧版/压缩包安装迁移至最新公开版，请按 README「旧版/压缩包迁移」保留 .env 与 data/ 后重新克隆并执行 bash setup.sh --install-cli。\n' >&2
         exit 1
+      fi
+      if command -v flock >/dev/null 2>&1; then
+        exec {update_lock}>"$WORK_DIR/.git/adkiller-update.lock"
+        if ! flock -n "$update_lock"; then
+          printf '已有一次AI-智能广告杀手更新在运行，请等待结束。\n' >&2
+          exit 1
+        fi
       fi
       printf '%s正在拉取 AI-智能广告杀手 最新代码...%s\n' "$C_CYAN" "$C_RESET"
       if ! git -C "$WORK_DIR" pull --ff-only; then
@@ -1024,7 +1031,7 @@ else
   CUR_DIR="$(pwd)"
   if verify_adkiller_dir "$CUR_DIR"; then
     if ! verify_git_remote "$CUR_DIR"; then
-      printf '❌ 当前目录包含 AI-智能广告杀手 项目文件，但其 Git 远端与官方仓库不匹配。\n' >&2
+      printf '❌ 当前目录包含 AI-智能广告杀手 项目文件，但其 Git 远端与本仓库不匹配。\n' >&2
       printf '   • 若要配置此本地副本，请直接运行：bash ./setup.sh\n' >&2
       printf '   • 若要全新安装，请切换到其他空目录或设置 ADKILLER_DIR=<目录名> 后重试。\n' >&2
       exit 1

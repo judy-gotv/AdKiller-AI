@@ -29,7 +29,7 @@ class GroupSettings:
     flood_window: int = 8
     flood_max: int = 6
     via_bot_mode: str = "ban"         # "ban" | "ai" | "off"
-    start_cmd_mode: str = "delete"    # "delete" | "ban" | "off"
+    start_cmd_mode: str = "off"       # Legacy setting retained for database compatibility
     check_edited: bool = True
     announce_in_group: bool = True    # Announce ban in group chat (customizable template & auto-delete in GUI)
     announce_delete_seconds: int = 1800  # Auto-delete group ban notice after N seconds (default 30 min; 0 = keep forever)
@@ -48,6 +48,7 @@ class GroupSettings:
     exempt_reply_cache: bool = True       # Replies skip shared spam_cache auto-ban (always per-person review)
     admin_cache_fallback: bool = True     # Fall back to last known admin list (<=30m) on transient API timeout to avoid deleting admin msgs
     local_rules_enabled: bool = False     # Local keyword heuristic rules: OFF by default (let AI judge semantics to avoid polysemy false positives!)
+    first_message_only: bool = True       # Review each ordinary member's first message only
 
 
 class Storage:
@@ -92,7 +93,7 @@ class Storage:
                 flood_window INTEGER NOT NULL DEFAULT 8,
                 flood_max INTEGER NOT NULL DEFAULT 6,
                 via_bot_mode TEXT NOT NULL DEFAULT 'ban',
-                start_cmd_mode TEXT NOT NULL DEFAULT 'delete',
+                start_cmd_mode TEXT NOT NULL DEFAULT 'off',
                 check_edited INTEGER NOT NULL DEFAULT 1,
                 announce_in_group INTEGER NOT NULL DEFAULT 1,
                 announce_delete_seconds INTEGER NOT NULL DEFAULT 1800,
@@ -110,6 +111,7 @@ class Storage:
                 exempt_reply_cache INTEGER NOT NULL DEFAULT 1,
                 admin_cache_fallback INTEGER NOT NULL DEFAULT 1,
                 local_rules_enabled INTEGER NOT NULL DEFAULT 0,
+                first_message_only INTEGER NOT NULL DEFAULT 1,
                 updated_at REAL NOT NULL DEFAULT 0
             );
 
@@ -126,6 +128,7 @@ class Storage:
                 user_id INTEGER NOT NULL,
                 clean_count INTEGER NOT NULL DEFAULT 0,
                 first_seen_at REAL NOT NULL,
+                first_message_reviewed INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (chat_id, user_id)
             );
 
@@ -227,6 +230,7 @@ class Storage:
             "exempt_reply_cache": "INTEGER NOT NULL DEFAULT 1",
             "admin_cache_fallback": "INTEGER NOT NULL DEFAULT 1",
             "local_rules_enabled": "INTEGER NOT NULL DEFAULT 0",
+            "first_message_only": "INTEGER NOT NULL DEFAULT 1",
             "announce_delete_seconds": "INTEGER NOT NULL DEFAULT 1800",
             "announce_template": "TEXT NOT NULL DEFAULT ''",
         }
@@ -249,6 +253,12 @@ class Storage:
         for col, ddl in dm_additions.items():
             if col not in dm_cols:
                 self.conn.execute(f"ALTER TABLE daily_metrics ADD COLUMN {col} {ddl}")
+
+        user_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(user_stats)")}
+        if "first_message_reviewed" not in user_cols:
+            self.conn.execute(
+                "ALTER TABLE user_stats ADD COLUMN first_message_reviewed INTEGER NOT NULL DEFAULT 0"
+            )
         self.conn.commit()
 
     def _row_to_group(self, row: sqlite3.Row, fallback_title: str = "") -> GroupSettings:
@@ -287,6 +297,7 @@ class Storage:
             exempt_reply_cache=bool(row["exempt_reply_cache"]),
             admin_cache_fallback=bool(row["admin_cache_fallback"]),
             local_rules_enabled=bool(row["local_rules_enabled"]),
+            first_message_only=bool(row["first_message_only"]),
         )
 
     def close(self) -> None:
@@ -452,8 +463,8 @@ class Storage:
                 exempt_admins, exempt_anon_admin, exempt_linked_channel,
                 exempt_trusted, exempt_owners, external_channel_mode,
                 exempt_veteran_short, exempt_reply_cache, admin_cache_fallback,
-                local_rules_enabled, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                local_rules_enabled, first_message_only, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(chat_id) DO UPDATE SET
                 chat_title=excluded.chat_title,
                 enabled=excluded.enabled,
@@ -488,6 +499,7 @@ class Storage:
                 exempt_reply_cache=excluded.exempt_reply_cache,
                 admin_cache_fallback=excluded.admin_cache_fallback,
                 local_rules_enabled=excluded.local_rules_enabled,
+                first_message_only=excluded.first_message_only,
                 updated_at=excluded.updated_at
             """,
             (
@@ -525,6 +537,7 @@ class Storage:
                 int(gs.exempt_reply_cache),
                 int(gs.admin_cache_fallback),
                 int(gs.local_rules_enabled),
+                int(gs.first_message_only),
                 time.time(),
             ),
         )
@@ -615,6 +628,20 @@ class Storage:
         return int(row["c"]) if row else 0
 
     # ---- Clean message stats ----
+    def claim_first_message_review(self, chat_id: int, user_id: int) -> bool:
+        """Reserve a member's only review before network I/O, including across restarts."""
+        result = self.conn.execute(
+            """
+            INSERT INTO user_stats (chat_id, user_id, first_seen_at, first_message_reviewed)
+            VALUES (?, ?, ?, 1)
+            ON CONFLICT(chat_id, user_id) DO UPDATE SET first_message_reviewed = 1
+            WHERE clean_count = 0 AND first_message_reviewed = 0
+            """,
+            (chat_id, user_id, time.time()),
+        )
+        self.conn.commit()
+        return result.rowcount == 1
+
     def get_clean_count(self, chat_id: int, user_id: int) -> int:
         row = self.conn.execute(
             "SELECT clean_count FROM user_stats WHERE chat_id=? AND user_id=?",
@@ -768,6 +795,7 @@ class Storage:
         "ai_suspect",
         "anti_flood_review",
         "anti_flood_repeat",
+        "channel_review",
     )
     _AI_TRIGGERS = ("ai_text", "ai_vision", "edited_ai", "gray_zone", "ai_suspect")
 

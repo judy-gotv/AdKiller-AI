@@ -13,6 +13,8 @@ from telegram.constants import ChatType
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
+from .updater import request_update
+
 from . import __app_name__, __app_name_cn__, __version__
 from .branding import (
     DEFAULT_AVATAR_PATH,
@@ -60,10 +62,8 @@ from .xray import (
 logger = logging.getLogger("adkiller.panel")
 
 _VIA_LABELS = {"ban": "直接秒封", "ai": "交给AI判", "off": "不拦截"}
-_START_LABELS = {"delete": "秒删", "ban": "直接秒封", "off": "不拦截"}
-_EXT_CH_LABELS = {"ai": "正常审核", "ban": "一律拦截", "allow": "放行跳过"}
+_EXT_CH_LABELS = {"ai": "审核后由管理员决定封禁", "ban": "一律拦截", "allow": "放行跳过"}
 _CYCLE_VIA = {"ban": "ai", "ai": "off", "off": "ban"}
-_CYCLE_START = {"delete": "ban", "ban": "off", "off": "delete"}
 _CYCLE_EXT_CH = {"ai": "ban", "ban": "allow", "allow": "ai"}
 _CYCLE_SCORE = {70: 80, 80: 85, 85: 90, 90: 70}
 
@@ -511,10 +511,6 @@ def build_panel_view(engine: GuardEngine, gs: GroupSettings) -> tuple[str, Inlin
                     f"🧩 外联卡片：{_VIA_LABELS.get(gs.via_bot_mode, gs.via_bot_mode)}",
                     callback_data=f"cfg:viabot:{cid}",
                 ),
-                InlineKeyboardButton(
-                    f"⌨️ /start：{_START_LABELS.get(gs.start_cmd_mode, gs.start_cmd_mode)}",
-                    callback_data=f"cfg:startcmd:{cid}",
-                ),
             ],
             [
                 InlineKeyboardButton(
@@ -559,6 +555,7 @@ def build_exempts_view(engine: GuardEngine, gs: GroupSettings) -> tuple[str, Inl
     """Build per-group interactive GUI subpanel for all moderation exemptions & bypass rules."""
     cid = gs.chat_id
     ext_label = _EXT_CH_LABELS.get(gs.external_channel_mode, "正常审核")
+    review_scope = "仅审首条" if gs.first_message_only else "持续审核"
 
     def _onoff(flag: bool, on_txt: str = "✅ 豁免", off_txt: str = "⬜ 照常审核") -> str:
         return on_txt if flag else off_txt
@@ -573,7 +570,8 @@ def build_exempts_view(engine: GuardEngine, gs: GroupSettings) -> tuple[str, Inl
         f"• 🤝 白名单(/trust)：{_onoff(gs.exempt_trusted)}\n"
         f"• 👑 全局超管免检：{_onoff(gs.exempt_owners, '✅ 跨群免检', '⬜ 关闭（按群管理判定）')}\n"
         f"• 📣 外部频道马甲：{ext_label}\n"
-        f"• 👴 老群友短句免AI：{_onoff(gs.exempt_veteran_short, '✅ 开启（省 Token）', '⬜ 关闭（每条必审）')}\n"
+        f"• 👤 成员与频道语义审核：{review_scope}（后续仍检查刷屏和危险文件）\n"
+        f"• 👴 持续审核时老群友短句免AI：{_onoff(gs.exempt_veteran_short, '✅ 开启', '⬜ 关闭')}\n"
         f"• 💬 回复免缓存秒封：{_onoff(gs.exempt_reply_cache, '✅ 开启（逐人复核）', '⬜ 关闭（允许缓存秒封）')}\n"
         f"• 🛡 查管理超时防误删：{_onoff(gs.admin_cache_fallback, '✅ 开启（30分钟兜底）', '⬜ 关闭（严格实时）')}\n"
         f"━━━━━━━━━━━━━━\n"
@@ -609,6 +607,12 @@ def build_exempts_view(engine: GuardEngine, gs: GroupSettings) -> tuple[str, Inl
                 InlineKeyboardButton(
                     f"📣 外部频道：{ext_label}",
                     callback_data=f"cfg:ex_extch:{cid}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    f"👤 成员与频道：{review_scope}",
+                    callback_data=f"cfg:ex_first_msg:{cid}",
                 ),
             ],
             [
@@ -746,10 +750,7 @@ async def cmd_start_private(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def cmd_start_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Group /start: responds to verified group admins (incl. anonymous admins & linked channel) with a quick guide + /config button.
-
-    Non-admin /start messages are NOT marked handled so Group 1 anti-spam (start_cmd_mode) still catches spammers!
-    """
+    """Show the group setup guide to verified administrators."""
     engine: GuardEngine = context.application.bot_data["engine"]
     msg = update.message
     user = update.effective_user
@@ -1512,6 +1513,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user = query.from_user
     data = query.data
 
+    if data.startswith("deploy:"):
+        chat = getattr(query.message, "chat", None)
+        if not chat or chat.type != ChatType.PRIVATE or chat.id != user.id or not engine.is_owner(user.id):
+            await query.answer("仅机器人主人可在私聊中更新", show_alert=True)
+            return
+        result = await request_update(data.partition(":")[2], user.id)
+        feedback = {
+            "queued": "已开始更新。完成后我会私信你。",
+            "busy": "正在更新，请等待结果。",
+            "stale": "这条更新通知已失效，请使用最新通知。",
+            "denied": "宿主机未授权这个账号更新。",
+        }
+        await query.answer(feedback.get(result, "宿主机更新服务暂时不可用。"), show_alert=True)
+        return
+
     # 1. Join captcha answer callback
     if data.startswith("cap:"):
         parts = data.split(":")
@@ -2105,9 +2121,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         engine.storage.save_group(gs)
         toast = f"外部内联卡片策略：{_VIA_LABELS[gs.via_bot_mode]}"
     elif action == "startcmd":
-        gs.start_cmd_mode = _CYCLE_START.get(gs.start_cmd_mode, "delete")
-        engine.storage.save_group(gs)
-        toast = f"群内 /start 策略：{_START_LABELS[gs.start_cmd_mode]}"
+        toast = "普通 /start 指令已免审"
     elif action == "malware":
         gs.block_malware_files = not gs.block_malware_files
         engine.storage.save_group(gs)
@@ -2278,6 +2292,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "ex_trusted",
         "ex_owners",
         "ex_extch",
+        "ex_first_msg",
         "ex_short",
         "ex_reply",
         "ex_fallback",
@@ -2300,9 +2315,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         elif action == "ex_extch":
             gs.external_channel_mode = _CYCLE_EXT_CH.get(gs.external_channel_mode, "ai")
             toast = f"外部频道马甲策略：{_EXT_CH_LABELS[gs.external_channel_mode]}"
+        elif action == "ex_first_msg":
+            gs.first_message_only = not gs.first_message_only
+            toast = f"成员与频道语义审核已切换为{'仅审首条' if gs.first_message_only else '持续审核'}"
         elif action == "ex_short":
             gs.exempt_veteran_short = not gs.exempt_veteran_short
-            toast = f"老群友短消息免AI已{'开启' if gs.exempt_veteran_short else '关闭（每条必审）'}"
+            toast = f"持续审核时老群友短消息免AI已{'开启' if gs.exempt_veteran_short else '关闭'}"
         elif action == "ex_reply":
             gs.exempt_reply_cache = not gs.exempt_reply_cache
             toast = f"回复消息免缓存秒封已{'开启' if gs.exempt_reply_cache else '关闭'}"

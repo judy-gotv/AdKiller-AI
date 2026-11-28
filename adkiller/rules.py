@@ -112,7 +112,6 @@ _FUNNEL_RE = re.compile(
 # Private Telegram invite links hidden inside text_link / buttons / URLs
 _TG_INVITE_RE = re.compile(r"(t\.me/\+|t\.me/joinchat/|telegram\.me/\+|tg://join)", re.IGNORECASE)
 
-
 @dataclass
 class BasicRuleVerdict:
     score: int

@@ -24,7 +24,7 @@ from adkiller.guard import (
     SpamFingerprintCache,
     SwarmTracker,
 )
-from adkiller.llm import UniversalAIClient, parse_verdict_json
+from adkiller.llm import SpamVerdict, UniversalAIClient, parse_verdict_json
 from adkiller.prompts import SYSTEM_PROMPT
 from adkiller.rules import evaluate_basic_rules
 from adkiller.storage import Storage
@@ -623,6 +623,7 @@ class TestSecurityReviewRegressions(unittest.TestCase):
             eng = GuardEngine(cfg, db, llm)
             gs = eng.get_group_settings(-1001, "G")
             gs.cas_enabled = False
+            gs.first_message_only = False
             db.save_group(gs)
 
             async def fake_get_chat(uid: int):
@@ -1202,6 +1203,7 @@ class TestSecurityReviewRegressions(unittest.TestCase):
             eng = GuardEngine(cfg, db, llm)
             gs = eng.get_group_settings(-1001, "G")
             gs.cas_enabled = False
+            gs.first_message_only = False
             db.save_group(gs)
 
             captured_logs: list[str] = []
@@ -1311,6 +1313,7 @@ class TestSecurityReviewRegressions(unittest.TestCase):
             self.assertFalse(gs.exempt_owners)
             self.assertEqual(gs.external_channel_mode, "ai")
             self.assertTrue(gs.exempt_veteran_short)
+            self.assertTrue(gs.first_message_only)
             self.assertTrue(gs.exempt_reply_cache)
             self.assertTrue(gs.admin_cache_fallback)
 
@@ -1323,9 +1326,9 @@ class TestSecurityReviewRegressions(unittest.TestCase):
                 bot=SimpleNamespace(),
                 application=SimpleNamespace(bot_data={"engine": eng}),
             )
-            for cb_data in ("cfg:exempts:-1001", "cfg:ex_admins:-1001", "cfg:ex_extch:-1001", "cfg:ex_short:-1001"):
+            for action in ("exempts", "ex_admins", "ex_extch", "ex_short", "ex_first_msg"):
                 q = SimpleNamespace(
-                    data=cb_data,
+                    data=f"cfg:{action}:-1001",
                     from_user=SimpleNamespace(id=999),
                     message=SimpleNamespace(chat=SimpleNamespace(id=-1001, type="supergroup")),
                     answer=AsyncMock(),
@@ -1338,6 +1341,7 @@ class TestSecurityReviewRegressions(unittest.TestCase):
             self.assertFalse(gs_reloaded.exempt_admins)
             self.assertEqual(gs_reloaded.external_channel_mode, "ban")
             self.assertFalse(gs_reloaded.exempt_veteran_short)
+            self.assertFalse(gs_reloaded.first_message_only)
 
             # 3. With exempt_admins=False & exempt_owners=False (and opt-in local_rules_enabled=True),
             #    an admin/owner CAN self-test moderation!
@@ -2662,6 +2666,233 @@ class TestSecurityReviewRegressions(unittest.TestCase):
                 self.assertTrue(db.has_group(-100994))
             finally:
                 db.conn.close()
+
+
+class TestFirstMessageReview(unittest.IsolatedAsyncioTestCase):
+    async def test_established_member_joke_skips_semantic_moderation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, Storage(str(Path(tmp) / "moderation.db")) as db:
+            cfg = AppConfig(telegram_bot_token="t", ai_api_key="sk-test", owner_ids={999})
+            llm = UniversalAIClient("sk-test", "https://example.com/v1", "test-model")
+            self.addAsyncCleanup(llm.close)
+            llm.classify = AsyncMock(return_value=SpamVerdict(True, 98, "误认群友玩笑"))
+            eng = GuardEngine(cfg, db, llm)
+            gs = eng.get_group_settings(-1001)
+            gs.gray_zone_mute = False
+            db.save_group(gs)
+            db.increment_clean_count(-1001, 500)
+            bot = SimpleNamespace(
+                id=1,
+                get_chat_administrators=AsyncMock(return_value=[]),
+                get_chat=AsyncMock(return_value=SimpleNamespace(photo=None, bio="", personal_chat=None)),
+                delete_message=AsyncMock(),
+                ban_chat_member=AsyncMock(),
+                send_message=AsyncMock(),
+            )
+            ctx = SimpleNamespace(bot=bot)
+            joke = _fake_msg(text="胆大来洗米")
+            cached_joke = _fake_msg(msg_id=11, text="刚才有人开玩笑说胆大来洗米，原来是在玩梗")
+            fingerprint = eng.spam_cache.fingerprint_message(-1001, extract_xray(cached_joke), None)
+            self.assertIsNotNone(fingerprint)
+            eng.spam_cache.remember(fingerprint, 98, "历史误判")
+
+            await eng.handle_message(SimpleNamespace(edited_message=None, message=joke), ctx)
+            await eng.handle_message(SimpleNamespace(edited_message=None, message=cached_joke), ctx)
+            llm.classify.assert_not_awaited()
+            bot.delete_message.assert_not_awaited()
+            bot.ban_chat_member.assert_not_awaited()
+
+            executable = _fake_msg(msg_id=12, text="", document=SimpleNamespace(file_name="fixture.exe"))
+            await eng.handle_message(SimpleNamespace(edited_message=None, message=executable), ctx)
+            bot.delete_message.assert_any_await(-1001, 12)
+            bot.ban_chat_member.assert_awaited_once_with(-1001, 500, revoke_messages=True)
+            llm.classify.assert_not_awaited()
+
+    async def test_first_review_is_per_group_and_survives_concurrency_failure_and_restart(self) -> None:
+        cfg = AppConfig(telegram_bot_token="t", ai_api_key="sk-test", owner_ids={999})
+        llm = UniversalAIClient("sk-test", "https://example.com/v1", "test-model")
+        self.addAsyncCleanup(llm.close)
+        first_review_started = asyncio.Event()
+        finish_first_review = asyncio.Event()
+
+        async def unavailable(**kwargs):
+            first_review_started.set()
+            await finish_first_review.wait()
+            raise RuntimeError("test provider unavailable")
+
+        llm.classify = AsyncMock(side_effect=unavailable)
+        bot = SimpleNamespace(
+            id=1,
+            get_chat_administrators=AsyncMock(return_value=[]),
+            get_chat=AsyncMock(return_value=SimpleNamespace(photo=None, bio="", personal_chat=None)),
+            delete_message=AsyncMock(),
+            ban_chat_member=AsyncMock(),
+        )
+        ctx = SimpleNamespace(bot=bot)
+        first = _fake_msg(text="你好，第一次来")
+        second = _fake_msg(msg_id=11, text="胆大来洗米")
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "moderation.db")
+            with Storage(db_path) as db:
+                eng = GuardEngine(cfg, db, llm)
+                for chat_id in (-1001, -1002):
+                    gs = eng.get_group_settings(chat_id)
+                    gs.cas_enabled = False
+                    db.save_group(gs)
+                first_task = asyncio.create_task(
+                    eng.handle_message(SimpleNamespace(edited_message=None, message=first), ctx)
+                )
+                try:
+                    await asyncio.wait_for(first_review_started.wait(), timeout=2)
+                    await eng.handle_message(SimpleNamespace(edited_message=None, message=second), ctx)
+                    llm.classify.assert_awaited_once()
+                    self.assertIn(
+                        extract_xray(first).normalized_text, llm.classify.call_args.kwargs["summary_text"]
+                    )
+                finally:
+                    finish_first_review.set()
+                    await first_task
+                self.assertEqual(db.get_clean_count(-1001, 500), 0)
+
+            with Storage(db_path) as db:
+                eng = GuardEngine(cfg, db, llm)
+                llm.classify = AsyncMock(return_value=SpamVerdict(False, 0, "正常"))
+                await eng.handle_message(SimpleNamespace(edited_message=first, message=None), ctx)
+                await eng.handle_message(SimpleNamespace(edited_message=None, message=second), ctx)
+                llm.classify.assert_not_awaited()
+                bot.delete_message.assert_not_awaited()
+                bot.ban_chat_member.assert_not_awaited()
+
+                other_group = _fake_msg(chat_id=-1002)
+                await eng.handle_message(SimpleNamespace(edited_message=None, message=other_group), ctx)
+                llm.classify.assert_awaited_once()
+
+    async def test_plain_start_and_normal_first_messages_are_not_punished(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, Storage(str(Path(tmp) / "moderation.db")) as db:
+            cfg = AppConfig(telegram_bot_token="t", ai_api_key="sk-test", owner_ids={999})
+            llm = UniversalAIClient("sk-test", "https://example.com/v1", "test-model")
+            self.addAsyncCleanup(llm.close)
+            normal = SpamVerdict(False, 5, "正常玩笑")
+            spam = SpamVerdict(True, 98, "明确招揽广告")
+            llm.classify = AsyncMock(return_value=normal)
+            eng = GuardEngine(cfg, db, llm)
+            gs = eng.get_group_settings(-1001)
+            gs.cas_enabled = False
+            gs.start_cmd_mode = "ban"
+            db.save_group(gs)
+            bot = SimpleNamespace(
+                id=1,
+                get_chat_administrators=AsyncMock(return_value=[]),
+                get_chat=AsyncMock(return_value=SimpleNamespace(photo=object(), bio="Linux", personal_chat=None)),
+                delete_message=AsyncMock(),
+                ban_chat_member=AsyncMock(),
+                restrict_chat_member=AsyncMock(),
+                send_message=AsyncMock(),
+            )
+            ctx = SimpleNamespace(bot=bot)
+            for message_id, text in enumerate(("/start", "/start@ExampleBot test-token"), 1):
+                start = _fake_msg(msg_id=message_id, text=text)
+                await eng.handle_message(SimpleNamespace(edited_message=None, message=start), ctx)
+            llm.classify.assert_not_awaited()
+            bot.delete_message.assert_not_awaited()
+            bot.ban_chat_member.assert_not_awaited()
+
+            joke = _fake_msg(text="胆大来洗米")
+            joke.from_user.full_name = "小明"
+            await eng.handle_message(SimpleNamespace(edited_message=None, message=joke), ctx)
+
+            llm.classify.assert_awaited_once()
+            bot.delete_message.assert_not_awaited()
+            bot.ban_chat_member.assert_not_awaited()
+            bot.restrict_chat_member.assert_not_awaited()
+            self.assertEqual(db.get_recent_suspects()[0], 0)
+
+            ad = _fake_msg(msg_id=11, user_id=501, text="招代发，预付开工")
+            llm.classify.return_value = spam
+            await eng.handle_message(SimpleNamespace(edited_message=None, message=ad), ctx)
+            bot.ban_chat_member.assert_awaited_once_with(-1001, 501, revoke_messages=True)
+
+            bot.delete_message.reset_mock()
+            llm.classify.reset_mock()
+            llm.classify.return_value = normal
+            channel = SimpleNamespace(id=-10010, title="Test channel", username="test_channel")
+            channel_joke = _fake_msg(msg_id=12, user_id=0, text=joke.text, sender_chat=channel)
+            channel_reply = _fake_msg(msg_id=13, user_id=0, text="继续聊天", sender_chat=channel)
+            for message in (channel_joke, channel_reply):
+                await eng.handle_message(SimpleNamespace(edited_message=None, message=message), ctx)
+            llm.classify.assert_awaited_once()
+            bot.delete_message.assert_not_awaited()
+            self.assertEqual(db.get_recent_suspects()[0], 0)
+
+            other_channel = SimpleNamespace(id=-10020, title="Test ads", username="test_ads")
+            channel_ad = _fake_msg(msg_id=14, user_id=0, text=ad.text, sender_chat=other_channel)
+            bot.ban_chat_sender_chat = AsyncMock()
+            llm.classify.return_value = spam
+            await eng.handle_message(SimpleNamespace(edited_message=None, message=channel_ad), ctx)
+            bot.delete_message.assert_awaited_once_with(-1001, 14)
+            bot.ban_chat_sender_chat.assert_not_awaited()
+            _, suspects = db.get_recent_suspects()
+            self.assertEqual(suspects[0]["trigger_type"], "channel_review")
+
+    async def test_first_message_collection_ads_are_removed_without_reviewing_followups(self) -> None:
+        spam = SpamVerdict(True, 98, "明确招揽广告")
+        normal = SpamVerdict(False, 5, "正常交流")
+        cases = (
+            ("微信帮收款 赚一万", "加群看项目 一天7ooo", spam),
+            ("微信帮收款 赚一万", "加群看项目 日赚7千", spam),
+            ("微信帮收款 赚一万", "加群看项目", spam),
+            ("替我收米 日赚9000", "加群项目 日入6ooo", spam),
+            ("招代收 一天9ooo", "", spam),
+            ("胆大来洗米", "看看我的技术频道 https://t.me/example", normal),
+            ("替我收米 日赚9000是骗局，别信", "", normal),
+            ("帮我收款 日结150元", "", normal),
+        )
+        with tempfile.TemporaryDirectory() as tmp, Storage(str(Path(tmp) / "moderation.db")) as db:
+            cfg = AppConfig(telegram_bot_token="t", ai_api_key="sk-test", owner_ids={999})
+            llm = UniversalAIClient("sk-test", "https://example.com/v1", "test-model")
+            self.addAsyncCleanup(llm.close)
+            llm.classify = AsyncMock()
+            eng = GuardEngine(cfg, db, llm)
+            gs = eng.get_group_settings(-1001)
+            gs.spam_score = 85
+            gs.cas_enabled = False
+            gs.announce_in_group = False
+            db.save_group(gs)
+            bot = SimpleNamespace(
+                id=1,
+                get_chat_administrators=AsyncMock(return_value=[]),
+                get_chat=AsyncMock(),
+                delete_message=AsyncMock(),
+                ban_chat_member=AsyncMock(),
+                restrict_chat_member=AsyncMock(),
+                send_message=AsyncMock(),
+            )
+            ctx = SimpleNamespace(bot=bot)
+
+            for index, (text, bio, verdict) in enumerate(cases):
+                with self.subTest(text=text, bio=bio):
+                    llm.classify.reset_mock()
+                    llm.classify.return_value = verdict
+                    bot.get_chat.return_value = SimpleNamespace(photo=object(), bio=bio, personal_chat=None)
+                    bot.delete_message.reset_mock()
+                    bot.ban_chat_member.reset_mock()
+                    bot.restrict_chat_member.reset_mock()
+                    user_id = 500 + index
+                    first_id = 2 * index + 1
+                    first = _fake_msg(msg_id=first_id, user_id=user_id, text=text)
+                    followup = _fake_msg(msg_id=first_id + 1, user_id=user_id, text="微信帮收款 赚一万")
+
+                    await eng.handle_message(SimpleNamespace(edited_message=None, message=first), ctx)
+                    llm.classify.return_value = spam
+                    await eng.handle_message(SimpleNamespace(edited_message=None, message=followup), ctx)
+
+                    llm.classify.assert_awaited_once()
+                    bot.restrict_chat_member.assert_not_awaited()
+                    if verdict.is_spam:
+                        bot.delete_message.assert_awaited_once_with(-1001, first_id)
+                        bot.ban_chat_member.assert_awaited_once_with(-1001, user_id, revoke_messages=True)
+                    else:
+                        bot.delete_message.assert_not_awaited()
+                        bot.ban_chat_member.assert_not_awaited()
 
 
 class TestCoreFeatures(unittest.TestCase):
